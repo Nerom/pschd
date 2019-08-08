@@ -1,3 +1,9 @@
+.idea/
+.gradle/
+.DS_Store
+**/*.iml
+**/target/
+
 # Compiled class file
 *.class
 
