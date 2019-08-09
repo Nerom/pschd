@@ -26,4 +26,8 @@ allprojects {
 
 subprojects {
     apply(plugin = "kotlin")
+
+    dependencies {
+        implementation(kotlin("stdlib"))
+    }
 }
