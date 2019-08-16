@@ -1,3 +1,5 @@
 package wang.nerom.pschd.event
 
-open class Event
+import java.io.Serializable
+
+open class Event : Serializable

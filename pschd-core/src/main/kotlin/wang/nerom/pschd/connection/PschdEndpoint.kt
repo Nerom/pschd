@@ -1,9 +1,11 @@
 package wang.nerom.pschd.connection
 
+import java.io.Serializable
+
 class PschdEndpoint(
     val port: Int,
     val ipv4: String
-) {
+) : Serializable {
     val isEmpty = this == EMPTY
 
     companion object {

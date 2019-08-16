@@ -32,7 +32,7 @@ class DisruptorEventBus<T : Event> : EventBus<T> {
     private val disruptor: Disruptor<PackedEvent<T?>>
 
     init {
-        val eventFactory = { PackedEvent(null) } as EventFactory<PackedEvent<T?>>
+        val eventFactory = EventFactory<PackedEvent<T?>> { PackedEvent(null) }
         this.disruptor = Disruptor(
             eventFactory, 16, Executors.newFixedThreadPool(4, NamedThreadFactory("event-bus"))
         )
@@ -58,6 +58,8 @@ class DisruptorEventBus<T : Event> : EventBus<T> {
                 log.warn("none matched handler for $event")
             }
         })
+
+        disruptor.start()
     }
 
     private fun match(realEvent: T, handler: EventHandler<T>): Boolean {

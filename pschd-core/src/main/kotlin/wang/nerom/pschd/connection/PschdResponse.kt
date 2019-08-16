@@ -1,6 +1,8 @@
 package wang.nerom.pschd.connection
 
-class PschdResponse {
+import java.io.Serializable
+
+class PschdResponse : Serializable {
     val success: Boolean
     val errorCode: ErrorCode?
     val errorMsg: String

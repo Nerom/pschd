@@ -3,7 +3,9 @@ package wang.nerom.pschd.leader
 import com.alipay.remoting.BizContext
 import com.alipay.remoting.NamedThreadFactory
 import com.alipay.remoting.rpc.protocol.SyncUserProcessor
+import com.google.common.collect.ImmutableList
 import org.slf4j.LoggerFactory
+import wang.nerom.pschd.config.PschdConfig
 import wang.nerom.pschd.connection.PschdConnection
 import wang.nerom.pschd.connection.PschdEndpoint
 import wang.nerom.pschd.connection.PschdRequest
@@ -11,23 +13,25 @@ import wang.nerom.pschd.connection.PschdResponse
 import wang.nerom.pschd.event.DisruptorEventBus
 import wang.nerom.pschd.event.Event
 import wang.nerom.pschd.event.EventHandler
+import wang.nerom.pschd.util.HostUtil
 import wang.nerom.pschd.util.RandomUtil
+import java.util.ArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantReadWriteLock
 
-class PschdLeaderElection {
+class PschdNode {
     private val log = LoggerFactory.getLogger(javaClass)
-    private val connection = PschdConnection()
+    private val connection: PschdConnection
     private val eventBus = DisruptorEventBus<PschdEvent>()
     private val readWriteLock = ReentrantReadWriteLock()
     private val timer = Executors.newScheduledThreadPool(5, NamedThreadFactory("election-timer"))
     private var state = PschdNodeState.FOLLOWER
     private var term = 0L
     private var leader = PschdEndpoint.EMPTY
-    private var localEndpoint = PschdEndpoint.EMPTY
+    private var localEndpoint: PschdEndpoint
 
-    private var candidateList = arrayListOf<PschdEndpoint>()
+    private var candidateList: List<PschdEndpoint> = arrayListOf()
     /**
      * in millisecond
      */
@@ -37,9 +41,31 @@ class PschdLeaderElection {
 
     private var ballotCandidate = PschdEndpoint.EMPTY
     private var ballotTimestamp = 0L
+    private var ballotCandidates: ArrayList<PschdEndpoint> = arrayListOf()
+
+    constructor(config: PschdConfig) {
+        this.localEndpoint = PschdEndpoint(config.localPort, HostUtil.getIpv4())
+        this.connection = PschdConnection(config.localPort)
+        this.candidateList = parseCandidates(config.candidates)
+    }
+
+    private fun parseCandidates(candidates: String): List<PschdEndpoint> {
+        if (candidates.isBlank()) {
+            return listOf(localEndpoint)
+        }
+        val candidateList = candidates.trim().split(",").map { ca ->
+            val candidate = ca.trim().split(":")
+            PschdEndpoint(candidate[1].toInt(), candidate[0].trim())
+        }
+        val resultList = ArrayList<PschdEndpoint>()
+        if (!candidateList.contains(localEndpoint)) {
+            resultList.add(localEndpoint)
+        }
+        resultList.addAll(candidateList)
+        return ImmutableList.copyOf(resultList)
+    }
 
     fun doInit() {
-        setFollowerTimer()
         connection.registerProcessor(object : SyncUserProcessor<PschdRequest>() {
             override fun interest(): String {
                 return PschdRequest::class.java.name
@@ -50,6 +76,7 @@ class PschdLeaderElection {
                     PschdRequest.Action.HEARTBEAT -> EventType.LEADER_HEARTBEAT
                     PschdRequest.Action.ELECTION -> EventType.ASK_ELECTION
                     PschdRequest.Action.FOLLOW -> EventType.HEARTBEAT_REC
+                    PschdRequest.Action.BALLOT -> EventType.ELECTION_REC
                     else -> return PschdResponse(true)
                 }
                 return try {
@@ -67,7 +94,11 @@ class PschdLeaderElection {
                 }
             }
         })
+        connection.start()
+
         eventBus.addHandler(PschdEventHandler())
+
+        setFollowerTimer()
     }
 
     private fun setCandidateTimer() {
@@ -101,6 +132,7 @@ class PschdLeaderElection {
                 return
             }
             if (System.currentTimeMillis() - leadTimestamp < timeout) {
+                setFollowerTimer()
                 return
             }
 
@@ -130,6 +162,7 @@ class PschdLeaderElection {
     private fun electSelf() {
         ballotCandidate = localEndpoint
         ballotTimestamp = System.currentTimeMillis()
+        ballotCandidates = arrayListOf(localEndpoint)
         for (candidate in this.candidateList) {
             if (candidate == localEndpoint) {
                 continue
@@ -152,6 +185,7 @@ class PschdLeaderElection {
                 return
             }
             if (System.currentTimeMillis() - ballotTimestamp < timeout) {
+                setCandidateTimer()
                 return
             }
 
@@ -207,6 +241,7 @@ class PschdLeaderElection {
                 val preState = this.state
                 this.state = PschdNodeState.FOLLOWER
                 doEchoHeartbeat(e.endpoint)
+                setFollowerTimer()
                 if (preState == PschdNodeState.LEADER) {
                     doStepDown()
                 }
@@ -252,6 +287,30 @@ class PschdLeaderElection {
         log.info("endpoint ${e.endpoint} echoed term ${e.term}")
     }
 
+    /**
+     *
+     */
+    private fun receiveVote(e: PschdEvent) {
+        readWriteLock.writeLock().lock()
+        try {
+            if (state != PschdNodeState.CANDIDATE || e.term != term || System.currentTimeMillis() - ballotTimestamp > timeout) {
+                return
+            }
+            ballotCandidates.add(e.endpoint)
+            if (ballotCandidates.size > (candidateList.size / 2 + 1)) {
+                doStepUp()
+            }
+        } finally {
+            readWriteLock.writeLock().unlock()
+        }
+    }
+
+    private fun doStepUp() {
+        this.state = PschdNodeState.LEADER
+        this.leadTimestamp = System.currentTimeMillis()
+        sendHeartbeat()
+    }
+
 
     /**
      * event
@@ -291,7 +350,11 @@ class PschdLeaderElection {
         /**
          * when leader received heartbeat response
          */
-        HEARTBEAT_REC
+        HEARTBEAT_REC,
+        /**
+         * when candidate receive election response
+         */
+        ELECTION_REC
     }
 
     inner class PschdEventHandler : EventHandler<PschdEvent> {
@@ -303,6 +366,7 @@ class PschdLeaderElection {
                 EventType.HEARTBEAT_REC -> onHeartbeatEcho(e)
                 EventType.ASK_ELECTION -> onAskElection(e)
                 EventType.LEADER_HEARTBEAT -> onLeaderHeartbeat(e)
+                EventType.ELECTION_REC -> receiveVote(e)
             }
         }
 
