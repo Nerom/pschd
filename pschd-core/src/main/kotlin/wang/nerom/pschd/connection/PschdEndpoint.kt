@@ -1,17 +1,30 @@
 package wang.nerom.pschd.connection
 
-import wang.nerom.pschd.util.HostUtil
+class PschdEndpoint(
+    val port: Int,
+    val ipv4: String
+) {
+    val isEmpty = this == EMPTY
 
-class PschdEndpoint {
-    val port: Int
-    val hostName: String?
-    val ipv4: String?
-    val ipv6: String?
+    companion object {
+        val EMPTY = PschdEndpoint(0, "")
+    }
 
-    constructor(port: Int) {
-        this.port = port
-        ipv4 = HostUtil.getIpv4()
-        hostName = null
-        ipv6 = null
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+
+        other as PschdEndpoint
+
+        if (port != other.port) return false
+        if (ipv4 != other.ipv4) return false
+
+        return true
+    }
+
+    override fun hashCode(): Int {
+        var result = port
+        result = 31 * result + ipv4.hashCode()
+        return result
     }
 }

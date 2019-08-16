@@ -1,38 +1,313 @@
 package wang.nerom.pschd.leader
 
+import com.alipay.remoting.BizContext
 import com.alipay.remoting.NamedThreadFactory
+import com.alipay.remoting.rpc.protocol.SyncUserProcessor
+import org.slf4j.LoggerFactory
+import wang.nerom.pschd.connection.PschdConnection
+import wang.nerom.pschd.connection.PschdEndpoint
+import wang.nerom.pschd.connection.PschdRequest
+import wang.nerom.pschd.connection.PschdResponse
 import wang.nerom.pschd.event.DisruptorEventBus
 import wang.nerom.pschd.event.Event
+import wang.nerom.pschd.event.EventHandler
 import wang.nerom.pschd.util.RandomUtil
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantReadWriteLock
 
 class PschdLeaderElection {
-    val eventBus = DisruptorEventBus<Event>()
-    val readWriteLock = ReentrantReadWriteLock()
-    val timer = Executors.newScheduledThreadPool(5, NamedThreadFactory("election-timer"))
-    var state = PschdNodeState.FOLLOWER
-    var term = 0L
-    var leader = ""
-    var leadTimestamp = 0L
-    var candidateList = arrayListOf<String>()
+    private val log = LoggerFactory.getLogger(javaClass)
+    private val connection = PschdConnection()
+    private val eventBus = DisruptorEventBus<PschdEvent>()
+    private val readWriteLock = ReentrantReadWriteLock()
+    private val timer = Executors.newScheduledThreadPool(5, NamedThreadFactory("election-timer"))
+    private var state = PschdNodeState.FOLLOWER
+    private var term = 0L
+    private var leader = PschdEndpoint.EMPTY
+    private var localEndpoint = PschdEndpoint.EMPTY
+
+    private var candidateList = arrayListOf<PschdEndpoint>()
     /**
      * in millisecond
      */
-    var timeout = 1000L
-    var maxDelay = 500L
+    private var leadTimestamp = 0L
+    private var timeout = 1000L
+    private var maxDelay = 500L
+
+    private var ballotCandidate = PschdEndpoint.EMPTY
+    private var ballotTimestamp = 0L
 
     fun doInit() {
-        timer.schedule({ doElectionTimeout() }, timeout + RandomUtil.random(maxDelay), TimeUnit.MILLISECONDS)
+        setFollowerTimer()
+        connection.registerProcessor(object : SyncUserProcessor<PschdRequest>() {
+            override fun interest(): String {
+                return PschdRequest::class.java.name
+            }
+
+            override fun handleRequest(bizCtx: BizContext?, request: PschdRequest?): PschdResponse {
+                var eventType = when (request?.action) {
+                    PschdRequest.Action.HEARTBEAT -> EventType.LEADER_HEARTBEAT
+                    PschdRequest.Action.ELECTION -> EventType.ASK_ELECTION
+                    PschdRequest.Action.FOLLOW -> EventType.HEARTBEAT_REC
+                    else -> return PschdResponse(true)
+                }
+                return try {
+                    val event = PschdEvent(eventType)
+                    event.term = request.term
+                    event.endpoint = request.endpoint
+                    eventBus.publish(event)
+                    PschdResponse(true)
+                } catch (e: Throwable) {
+                    log.error(
+                        "on leader heartbeat processor error, errMsg:${e.message}, endpoint:${request.endpoint}, term:${request.term}",
+                        e
+                    )
+                    PschdResponse(PschdResponse.ErrorCode.SYS_ERR, e.message ?: "")
+                }
+            }
+        })
+        eventBus.addHandler(PschdEventHandler())
+    }
+
+    private fun setCandidateTimer() {
+        timer.schedule(
+            { eventBus.publish(PschdEvent(EventType.BALLOT_TIMEOUT)) },
+            timeout + RandomUtil.random(maxDelay),
+            TimeUnit.MILLISECONDS
+        )
+    }
+
+    private fun setFollowerTimer() {
+        timer.schedule(
+            { eventBus.publish(PschdEvent(EventType.ELECTION_TIMEOUT)) },
+            timeout + RandomUtil.random(maxDelay),
+            TimeUnit.MILLISECONDS
+        )
+    }
+
+    private fun setLeaderTimer() {
+        timer.schedule(
+            { eventBus.publish(PschdEvent(EventType.LEADER_TIMEOUT)) },
+            timeout shr 1,
+            TimeUnit.MILLISECONDS
+        )
     }
 
     fun doElectionTimeout() {
         readWriteLock.writeLock().lock()
         try {
+            if (this.state != PschdNodeState.FOLLOWER) {
+                return
+            }
+            if (System.currentTimeMillis() - leadTimestamp < timeout) {
+                return
+            }
+
             this.state = PschdNodeState.CANDIDATE
+
+            startBallot()
         } finally {
             readWriteLock.writeLock().unlock()
+        }
+    }
+
+    /**
+     * call in write lock
+     */
+    private fun startBallot() {
+        if (System.currentTimeMillis() - ballotTimestamp < timeout) {
+            return
+        }
+        term++
+        electSelf()
+        setCandidateTimer()
+    }
+
+    /**
+     * call in write lock
+     */
+    private fun electSelf() {
+        ballotCandidate = localEndpoint
+        ballotTimestamp = System.currentTimeMillis()
+        for (candidate in this.candidateList) {
+            if (candidate == localEndpoint) {
+                continue
+            }
+            val request = PschdRequest()
+            request.action = PschdRequest.Action.ELECTION
+            request.term = this.term
+            request.endpoint = this.localEndpoint
+            val response = connection.invokeSync(candidate, request)
+            if (!response.success) {
+                log.warn("request to candidate [$candidate] election failed, errorCode:${response.errorCode}, errMsg:${response.errorMsg}")
+            }
+        }
+    }
+
+    fun doBallotTimeout() {
+        readWriteLock.writeLock().lock()
+        try {
+            if (this.state != PschdNodeState.CANDIDATE) {
+                return
+            }
+            if (System.currentTimeMillis() - ballotTimestamp < timeout) {
+                return
+            }
+
+            startBallot()
+        } finally {
+            readWriteLock.writeLock().unlock()
+        }
+    }
+
+    fun sendHeartbeat() {
+        readWriteLock.writeLock().lock()
+        try {
+            for (candidate in this.candidateList) {
+                if (candidate == localEndpoint) {
+                    continue
+                }
+                val request = PschdRequest()
+                request.action = PschdRequest.Action.HEARTBEAT
+                request.term = this.term
+                request.endpoint = this.localEndpoint
+                val response = connection.invokeSync(candidate, request)
+                if (!response.success) {
+                    log.warn("request to candidate [$candidate] election failed, errorCode:${response.errorCode}, errMsg:${response.errorMsg}")
+                }
+            }
+            leadTimestamp = System.currentTimeMillis()
+            setLeaderTimer()
+        } finally {
+            readWriteLock.writeLock().unlock()
+        }
+    }
+
+    private fun onLeaderHeartbeat(e: PschdEvent) {
+        readWriteLock.writeLock().lock()
+        try {
+            if (e.term < term) {
+                doEchoHeartbeat(e.endpoint)
+                return
+            }
+            if (e.term == term) {
+                if (leader == e.endpoint) {
+                    leadTimestamp = System.currentTimeMillis()
+                } else {
+                    this.state = PschdNodeState.CANDIDATE
+                    startBallot()
+                }
+                doEchoHeartbeat(e.endpoint)
+            }
+            if (e.term > term) {
+                leader = e.endpoint
+                term = e.term
+                leadTimestamp = System.currentTimeMillis()
+                val preState = this.state
+                this.state = PschdNodeState.FOLLOWER
+                doEchoHeartbeat(e.endpoint)
+                if (preState == PschdNodeState.LEADER) {
+                    doStepDown()
+                }
+            }
+        } finally {
+            readWriteLock.writeLock().unlock()
+        }
+    }
+
+    private fun doEchoHeartbeat(endpoint: PschdEndpoint) {
+        log.info("received endpoint $endpoint leader heartbeat")
+    }
+
+    /**
+     * call in write lock
+     */
+    private fun doStepDown() {
+        log.warn("leader $localEndpoint step down cause new term $term raised or electing new leader $leader")
+    }
+
+    private fun onAskElection(e: PschdEvent) {
+        readWriteLock.writeLock().lock()
+        try {
+            if (e.term <= term) {
+                return
+            }
+            term = e.term
+            if (state == PschdNodeState.LEADER) {
+                doStepDown()
+            }
+            this.leader = PschdEndpoint.EMPTY
+            this.leadTimestamp = System.currentTimeMillis()
+            this.ballotTimestamp = System.currentTimeMillis()
+            this.ballotCandidate = e.endpoint
+            this.state = PschdNodeState.CANDIDATE
+            setCandidateTimer()
+        } finally {
+            readWriteLock.writeLock().unlock()
+        }
+    }
+
+    private fun onHeartbeatEcho(e: PschdEvent) {
+        log.info("endpoint ${e.endpoint} echoed term ${e.term}")
+    }
+
+
+    /**
+     * event
+     */
+    inner class PschdEvent() : Event() {
+        var eventType: EventType = EventType.ELECTION_TIMEOUT
+        var term = 0L
+        var endpoint = PschdEndpoint.EMPTY
+
+        constructor(eventType: EventType) : this() {
+            this.eventType = eventType
+        }
+    }
+
+    enum class EventType {
+        /**
+         * when follower fail to receive leader's heartbeat
+         */
+        ELECTION_TIMEOUT,
+        /**
+         * when candidate fail to receive the most of votes
+         */
+        BALLOT_TIMEOUT,
+        /**
+         * when leader need to send heartbeat to followers
+         */
+        LEADER_TIMEOUT,
+
+        /**
+         * when received leader heartbeat
+         */
+        LEADER_HEARTBEAT,
+        /**
+         * when received election request
+         */
+        ASK_ELECTION,
+        /**
+         * when leader received heartbeat response
+         */
+        HEARTBEAT_REC
+    }
+
+    inner class PschdEventHandler : EventHandler<PschdEvent> {
+        override fun handle(e: PschdEvent) {
+            when (e.eventType) {
+                EventType.ELECTION_TIMEOUT -> doElectionTimeout()
+                EventType.BALLOT_TIMEOUT -> doBallotTimeout()
+                EventType.LEADER_TIMEOUT -> sendHeartbeat()
+                EventType.HEARTBEAT_REC -> onHeartbeatEcho(e)
+                EventType.ASK_ELECTION -> onAskElection(e)
+                EventType.LEADER_HEARTBEAT -> onLeaderHeartbeat(e)
+            }
+        }
+
+        override fun interest(e: PschdEvent): Boolean {
+            return true
         }
     }
 }

@@ -62,7 +62,7 @@ class DisruptorEventBus<T : Event> : EventBus<T> {
 
     private fun match(realEvent: T, handler: EventHandler<T>): Boolean {
         return try {
-            handler.recognize(realEvent)
+            handler.interest(realEvent)
         } catch (e: Throwable) {
             log.error("try match handler [$handler] for event [$realEvent] error, errorMsg:${e.message}", e)
             false

@@ -8,5 +8,5 @@ interface EventHandler<T : Event> {
      * if true then handle, otherwise skip
      * any exception will be take as false
      */
-    fun recognize(e: T): Boolean
+    fun interest(e: T): Boolean
 }
