@@ -3,13 +3,13 @@ package wang.nerom.pschd.connection
 import java.io.Serializable
 
 class PschdEndpoint(
-    val port: Int,
-    val ipv4: String
+    val ipv4: String,
+    val port: Int
 ) : Serializable {
     val isEmpty = this == EMPTY
 
     companion object {
-        val EMPTY = PschdEndpoint(0, "")
+        val EMPTY = PschdEndpoint("", 0)
     }
 
     override fun equals(other: Any?): Boolean {
@@ -18,15 +18,19 @@ class PschdEndpoint(
 
         other as PschdEndpoint
 
-        if (port != other.port) return false
         if (ipv4 != other.ipv4) return false
+        if (port != other.port) return false
 
         return true
     }
 
     override fun hashCode(): Int {
-        var result = port
-        result = 31 * result + ipv4.hashCode()
+        var result = ipv4.hashCode()
+        result = 31 * result + port
         return result
+    }
+
+    override fun toString(): String {
+        return "PschdEndpoint(ipv4='$ipv4', port=$port)"
     }
 }

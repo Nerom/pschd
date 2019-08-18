@@ -44,7 +44,7 @@ class PschdNode {
     private var ballotCandidates: ArrayList<PschdEndpoint> = arrayListOf()
 
     constructor(config: PschdConfig) {
-        this.localEndpoint = PschdEndpoint(config.localPort, HostUtil.getIpv4())
+        this.localEndpoint = PschdEndpoint(HostUtil.getIpv4(), config.localPort)
         this.connection = PschdConnection(config.localPort)
         this.candidateList = parseCandidates(config.candidates)
     }
@@ -55,7 +55,7 @@ class PschdNode {
         }
         val candidateList = candidates.trim().split(",").map { ca ->
             val candidate = ca.trim().split(":")
-            PschdEndpoint(candidate[1].toInt(), candidate[0].trim())
+            PschdEndpoint(candidate[0].trim(), candidate[1].toInt())
         }
         val resultList = ArrayList<PschdEndpoint>()
         if (!candidateList.contains(localEndpoint)) {
@@ -139,6 +139,8 @@ class PschdNode {
             this.state = PschdNodeState.CANDIDATE
 
             startBallot()
+        } catch (e: Throwable) {
+            log.error("endpoint $localEndpoint doElectionTimeout process error, errMsg:${e.message}", e)
         } finally {
             readWriteLock.writeLock().unlock()
         }
@@ -190,6 +192,8 @@ class PschdNode {
             }
 
             startBallot()
+        } catch (e: Throwable) {
+            log.error("endpoint $localEndpoint doBallotTimeout process error, errMsg:${e.message}", e)
         } finally {
             readWriteLock.writeLock().unlock()
         }
@@ -213,6 +217,8 @@ class PschdNode {
             }
             leadTimestamp = System.currentTimeMillis()
             setLeaderTimer()
+        } catch (e: Throwable) {
+            log.error("endpoint $localEndpoint sendHeartbeat process error, errMsg:${e.message}", e)
         } finally {
             readWriteLock.writeLock().unlock()
         }
@@ -222,19 +228,26 @@ class PschdNode {
         readWriteLock.writeLock().lock()
         try {
             if (e.term < term) {
+                log.warn("received term ${e.term} heartbeat from ${e.endpoint}, but current term is $term on endpoint $localEndpoint")
                 doEchoHeartbeat(e.endpoint)
                 return
             }
             if (e.term == term) {
                 if (leader == e.endpoint) {
                     leadTimestamp = System.currentTimeMillis()
+                } else if (state == PschdNodeState.CANDIDATE && ballotCandidate == e.endpoint) {
+                    leader = e.endpoint
+                    state = PschdNodeState.FOLLOWER
+                    leadTimestamp = System.currentTimeMillis()
                 } else {
+                    log.warn("received term ${e.term} heartbeat from ${e.endpoint}, but current term is $term current leader is $leader on endpoint $localEndpoint")
                     this.state = PschdNodeState.CANDIDATE
                     startBallot()
                 }
                 doEchoHeartbeat(e.endpoint)
             }
             if (e.term > term) {
+                log.warn("received term ${e.term} heartbeat from ${e.endpoint}, but current term is $term current leader is $leader on endpoint $localEndpoint")
                 leader = e.endpoint
                 term = e.term
                 leadTimestamp = System.currentTimeMillis()
@@ -246,13 +259,15 @@ class PschdNode {
                     doStepDown()
                 }
             }
+        } catch (e: Throwable) {
+            log.error("endpoint $localEndpoint onLeaderHeartbeat process error, errMsg:${e.message}", e)
         } finally {
             readWriteLock.writeLock().unlock()
         }
     }
 
     private fun doEchoHeartbeat(endpoint: PschdEndpoint) {
-        log.info("received endpoint $endpoint leader heartbeat")
+        log.info("received endpoint $endpoint term $term leader heartbeat")
     }
 
     /**
@@ -269,15 +284,25 @@ class PschdNode {
                 return
             }
             term = e.term
-            if (state == PschdNodeState.LEADER) {
-                doStepDown()
-            }
+            val preState = state
             this.leader = PschdEndpoint.EMPTY
             this.leadTimestamp = System.currentTimeMillis()
             this.ballotTimestamp = System.currentTimeMillis()
             this.ballotCandidate = e.endpoint
             this.state = PschdNodeState.CANDIDATE
+
+            val request = PschdRequest()
+            request.action = PschdRequest.Action.BALLOT
+            request.term = this.term
+            request.endpoint = this.localEndpoint
+            connection.invokeSync(e.endpoint, request)
+
+            if (preState == PschdNodeState.LEADER) {
+                doStepDown()
+            }
             setCandidateTimer()
+        } catch (e: Throwable) {
+            log.error("endpoint $localEndpoint onAskElection process error, errMsg:${e.message}", e)
         } finally {
             readWriteLock.writeLock().unlock()
         }
@@ -291,15 +316,19 @@ class PschdNode {
      *
      */
     private fun receiveVote(e: PschdEvent) {
+        log.info("term $term endpoint $localEndpoint received vote of term ${e.term} endpoint ${e.endpoint}")
         readWriteLock.writeLock().lock()
         try {
             if (state != PschdNodeState.CANDIDATE || e.term != term || System.currentTimeMillis() - ballotTimestamp > timeout) {
                 return
             }
             ballotCandidates.add(e.endpoint)
+            log.info("endpoint $localEndpoint term $term ballot: [${ballotCandidates.size}/${candidateList.size}]")
             if (ballotCandidates.size > (candidateList.size / 2 + 1)) {
                 doStepUp()
             }
+        } catch (e: Throwable) {
+            log.error("endpoint $localEndpoint receiveVote process error, errMsg:${e.message}", e)
         } finally {
             readWriteLock.writeLock().unlock()
         }
@@ -309,6 +338,7 @@ class PschdNode {
         this.state = PschdNodeState.LEADER
         this.leadTimestamp = System.currentTimeMillis()
         sendHeartbeat()
+        log.info("term $term is under candidate $localEndpoint lead")
     }
 
 
