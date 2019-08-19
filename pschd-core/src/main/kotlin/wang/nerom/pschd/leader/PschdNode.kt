@@ -324,7 +324,7 @@ class PschdNode {
             }
             ballotCandidates.add(e.endpoint)
             log.info("endpoint $localEndpoint term $term ballot: [${ballotCandidates.size}/${candidateList.size}]")
-            if (ballotCandidates.size > (candidateList.size / 2 + 1)) {
+            if (ballotCandidates.size > candidateList.size / 2) {
                 doStepUp()
             }
         } catch (e: Throwable) {
